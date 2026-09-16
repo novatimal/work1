@@ -708,6 +708,632 @@ HOST_TIMEOUT = 40.0
 NET_POS_RATE = 0.033
 lastNetPosTime = 0.0
 
+-- ============================================================
+-- БИНАРНЫЙ НЕТВОРКИНГ МОДУЛЬ
+-- ============================================================
+-- Формат пакета:
+-- [1 байт: тип пакета][данные...]
+-- Типы пакетов:
+PacketType = {
+    HELLO = 1,
+    ASSIGN = 2,
+    DISCONNECT = 3,
+    END = 4,
+    POS = 5,
+    OBJ = 6,
+    SHOOT = 7,
+    MNG_CHARGE = 8,
+    MNG_FIRE = 9,
+    MNG_STOP = 10,
+    IMPACT = 11,
+    BLOOD = 12,
+    HIT = 13,
+    DEAD = 14,
+    RESPAWN = 15,
+    TEAM = 16,
+    NAME = 17,
+    SKIN = 18,
+    MUSICKIT = 19,
+    WEAPON = 20,
+    RELOAD = 21,
+    PUMP = 22,
+    EXPLOSION = 23,
+    SMOKE = 24,
+    FLASH = 25,
+    WARP = 26,
+    THROW = 27,
+    MATCH_OVER = 28,
+    ROUND_WIN = 29,
+    ROUND_RESET = 30,
+    INIT = 31,
+    MODE = 32,
+    PING = 33,
+    HB = 34,
+}
+
+-- Обратная мапа для отладки
+PacketTypeName = {}
+for k, v in pairs(PacketType) do
+    PacketTypeName[v] = k
+end
+
+-- Вспомогательные функции для бинарной сериализации
+BinaryNet = {}
+
+-- Упаковать ID игрока (uint16)
+function BinaryNet.packID(id)
+    return string.pack("<H", id or 0)
+end
+
+-- Распаковать ID игрока
+function BinaryNet.unpackID(data, offset)
+    return string.unpack("<H", data, offset)
+end
+
+-- Упаковать строку с длиной (uint16 + bytes)
+function BinaryNet.packString(str)
+    if not str then
+        return string.pack("<H", 0)
+    end
+    local len = #str
+    if len > 65535 then
+        len = 65535
+        str = str:sub(1, len)
+    end
+    return string.pack("<H" .. len .. "s", len, str)
+end
+
+-- Распаковать строку с длиной
+function BinaryNet.unpackString(data, offset)
+    local len = string.unpack("<H", data, offset)
+    offset = offset + 2
+    if len == 0 then
+        return "", offset
+    end
+    local str = string.unpack(len .. "s", data, offset)
+    return str, offset + len
+end
+
+-- Упаковать float (little-endian)
+function BinaryNet.packFloat(val)
+    return string.pack("<f", val or 0.0)
+end
+
+-- Распаковать float
+function BinaryNet.unpackFloat(data, offset)
+    return string.unpack("<f", data, offset)
+end
+
+-- Упаковать vec3 (3 float)
+function BinaryNet.packVec3(v)
+    return string.pack("<fff", v.x or 0, v.y or 0, v.z or 0)
+end
+
+-- Распаковать vec3
+function BinaryNet.unpackVec3(data, offset)
+    local x, y, z = string.unpack("<fff", data, offset)
+    return {x = x, y = y, z = z}, offset + 12
+end
+
+-- Упаковать пакет POS: type(1) + id(2) + pos(12) + yaw(4) + team(2) = 21 байт
+function BinaryNet.packPOS(id, pos, yaw, team)
+    return string.pack("<BHfffH", PacketType.POS, id, pos.x, pos.y, pos.z, yaw, team)
+end
+
+-- Распаковать пакет POS
+function BinaryNet.unpackPOS(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local x, y, z = string.unpack("<fff", data, offset)
+    offset = offset + 12
+    local yaw, team = string.unpack("<fH", data, offset)
+    return {id = id, pos = {x = x, y = y, z = z}, yaw = yaw, team = team}, offset + 6
+end
+
+-- Упаковать пакет SHOOT: type(1) + id(2) + pos(12) + dir(12) = 27 байт
+function BinaryNet.packSHOOT(id, pos, dir)
+    return string.pack("<BHffffff", PacketType.SHOOT, id, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z)
+end
+
+-- Распаковать пакет SHOOT
+function BinaryNet.unpackSHOOT(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local px, py, pz, dx, dy, dz = string.unpack("<ffffff", data, offset)
+    return {id = id, pos = {x = px, y = py, z = pz}, dir = {x = dx, y = dy, z = dz}}, offset + 24
+end
+
+-- Упаковать пакет DEAD: type(1) + targetID(2) + killerID(2) + headshot(1) = 6 байт
+function BinaryNet.packDEAD(targetID, killerID, isHeadshot)
+    return string.pack("<BHHB", PacketType.DEAD, targetID, killerID, isHeadshot and 1 or 0)
+end
+
+-- Распаковать пакет DEAD
+function BinaryNet.unpackDEAD(data, offset)
+    local ptype, targetID, killerID, hs = string.unpack("<BHHB", data, offset)
+    return {targetID = targetID, killerID = killerID, isHeadshot = (hs == 1)}, offset + 6
+end
+
+-- Упаковать пакет TEAM: type(1) + id(2) + team(2) = 5 байт
+function BinaryNet.packTEAM(id, team)
+    return string.pack("<BHH", PacketType.TEAM, id, team)
+end
+
+-- Распаковать пакет TEAM
+function BinaryNet.unpackTEAM(data, offset)
+    local ptype, id, team = string.unpack("<BHH", data, offset)
+    return {id = id, team = team}, offset + 5
+end
+
+-- Упаковать пакет NAME: type(1) + id(2) + name(string)
+function BinaryNet.packNAME(id, name)
+    local header = string.pack("<BH", PacketType.NAME, id)
+    return header .. BinaryNet.packString(name)
+end
+
+-- Распаковать пакет NAME
+function BinaryNet.unpackNAME(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local name, newOffset = BinaryNet.unpackString(data, offset)
+    return {id = id, name = name}, newOffset
+end
+
+-- Упаковать пакет SKIN: type(1) + id(2) + skin(string)
+function BinaryNet.packSKIN(id, skin)
+    local header = string.pack("<BH", PacketType.SKIN, id)
+    return header .. BinaryNet.packString(skin)
+end
+
+-- Распаковать пакет SKIN
+function BinaryNet.unpackSKIN(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local skin, newOffset = BinaryNet.unpackString(data, offset)
+    return {id = id, skin = skin}, newOffset
+end
+
+-- Упаковать пакет MUSICKIT: type(1) + id(2) + musickit(string)
+function BinaryNet.packMUSICKIT(id, musickit)
+    local header = string.pack("<BH", PacketType.MUSICKIT, id)
+    return header .. BinaryNet.packString(musickit)
+end
+
+-- Распаковать пакет MUSICKIT
+function BinaryNet.unpackMUSICKIT(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local musickit, newOffset = BinaryNet.unpackString(data, offset)
+    return {id = id, musickit = musickit}, newOffset
+end
+
+-- Упаковать пакет WEAPON: type(1) + id(2) + weaponID(2) = 6 байт
+function BinaryNet.packWEAPON(id, weaponID)
+    return string.pack("<BHH", PacketType.WEAPON, id, weaponID)
+end
+
+-- Распаковать пакет WEAPON
+function BinaryNet.unpackWEAPON(data, offset)
+    local ptype, id, weaponID = string.unpack("<BHH", data, offset)
+    return {id = id, weaponID = weaponID}, offset + 5
+end
+
+-- Упаковать пакет RELOAD: type(1) + id(2) = 4 байта
+function BinaryNet.packRELOAD(id)
+    return string.pack("<BH", PacketType.RELOAD, id)
+end
+
+-- Распаковать пакет RELOAD
+function BinaryNet.unpackRELOAD(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    return {id = id}, offset + 3
+end
+
+-- Упаковать пакет PUMP: type(1) + id(2) = 4 байта
+function BinaryNet.packPUMP(id)
+    return string.pack("<BH", PacketType.PUMP, id)
+end
+
+-- Распаковать пакет PUMP
+function BinaryNet.unpackPUMP(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    return {id = id}, offset + 3
+end
+
+-- Упаковать пакет HELLO: type(1) + token(2) = 4 байта
+function BinaryNet.packHELLO(token)
+    return string.pack("<BH", PacketType.HELLO, token)
+end
+
+-- Распаковать пакет HELLO
+function BinaryNet.unpackHELLO(data, offset)
+    local ptype, token = string.unpack("<BH", data, offset)
+    return {token = token}, offset + 3
+end
+
+-- Упаковать пакет ASSIGN: type(1) + id(2) + token(2) = 6 байт
+function BinaryNet.packASSIGN(id, token)
+    return string.pack("<BHH", PacketType.ASSIGN, id, token)
+end
+
+-- Распаковать пакет ASSIGN
+function BinaryNet.unpackASSIGN(data, offset)
+    local ptype, id, token = string.unpack("<BHH", data, offset)
+    return {id = id, token = token}, offset + 5
+end
+
+-- Упаковать пакет DISCONNECT: type(1) + id(2) = 4 байта
+function BinaryNet.packDISCONNECT(id)
+    return string.pack("<BH", PacketType.DISCONNECT, id)
+end
+
+-- Распаковать пакет DISCONNECT
+function BinaryNet.unpackDISCONNECT(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    return {id = id}, offset + 3
+end
+
+-- Упаковать пакет END: type(1) = 1 байт
+function BinaryNet.packEND()
+    return string.pack("<B", PacketType.END)
+end
+
+-- Упаковать пакет HB (heartbeat): type(1) = 1 байт
+function BinaryNet.packHB()
+    return string.pack("<B", PacketType.HB)
+end
+
+-- Упаковать пакет PING: type(1) + id(2) = 4 байта
+function BinaryNet.packPING(id)
+    return string.pack("<BH", PacketType.PING, id)
+end
+
+-- Распаковать пакет PING
+function BinaryNet.unpackPING(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    return {id = id}, offset + 3
+end
+
+-- Упаковать пакет OBJ: type(1) + name(string) + pos(12) + rot(12)
+function BinaryNet.packOBJ(name, pos, rot)
+    local header = string.pack("<B", PacketType.OBJ)
+    return header .. BinaryNet.packString(name) .. BinaryNet.packVec3(pos) .. BinaryNet.packVec3(rot)
+end
+
+-- Распаковать пакет OBJ
+function BinaryNet.unpackOBJ(data, offset)
+    local ptype = string.unpack("<B", data, offset)
+    offset = offset + 1
+    local name, newOffset = BinaryNet.unpackString(data, offset)
+    local pos = BinaryNet.unpackVec3(data, newOffset)
+    newOffset = newOffset + 12
+    local rot = BinaryNet.unpackVec3(data, newOffset)
+    newOffset = newOffset + 12
+    return {name = name, pos = pos, rot = rot}, newOffset
+end
+
+-- Упаковать пакет EXPLOSION: type(1) + id(2) + pos(12) + force(4) = 23 байта
+function BinaryNet.packEXPLOSION(id, pos, force)
+    return string.pack("<BHffff", PacketType.EXPLOSION, id, pos.x, pos.y, pos.z, force)
+end
+
+-- Распаковать пакет EXPLOSION
+function BinaryNet.unpackEXPLOSION(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local x, y, z, force = string.unpack("<ffff", data, offset)
+    return {id = id, pos = {x = x, y = y, z = z}, force = force}, offset + 16
+end
+
+-- Упаковать пакет SMOKE: type(1) + pos(12) = 13 байт
+function BinaryNet.packSMOKE(pos)
+    return string.pack("<Bfff", PacketType.SMOKE, pos.x, pos.y, pos.z)
+end
+
+-- Распаковать пакет SMOKE
+function BinaryNet.unpackSMOKE(data, offset)
+    local ptype = string.unpack("<B", data, offset)
+    offset = offset + 1
+    local x, y, z = string.unpack("<fff", data, offset)
+    return {pos = {x = x, y = y, z = z}}, offset + 12
+end
+
+-- Упаковать пакет FLASH: type(1) + pos(12) = 13 байт
+function BinaryNet.packFLASH(pos)
+    return string.pack("<Bfff", PacketType.FLASH, pos.x, pos.y, pos.z)
+end
+
+-- Распаковать пакет FLASH
+function BinaryNet.unpackFLASH(data, offset)
+    local ptype = string.unpack("<B", data, offset)
+    offset = offset + 1
+    local x, y, z = string.unpack("<fff", data, offset)
+    return {pos = {x = x, y = y, z = z}}, offset + 12
+end
+
+-- Упаковать пакет WARP: type(1) + pos(12) + id(2) = 15 байт
+function BinaryNet.packWARP(pos, id)
+    return string.pack("<BfffH", PacketType.WARP, pos.x, pos.y, pos.z, id)
+end
+
+-- Распаковать пакет WARP
+function BinaryNet.unpackWARP(data, offset)
+    local ptype = string.unpack("<B", data, offset)
+    offset = offset + 1
+    local x, y, z = string.unpack("<fff", data, offset)
+    offset = offset + 12
+    local id = string.unpack("<H", data, offset)
+    return {pos = {x = x, y = y, z = z}, id = id}, offset + 2
+end
+
+-- Упаковать пакет THROW: type(1) + id(2) + pos(12) + dir(12) + grenadeType(string) + throwPower(4)
+function BinaryNet.packTHROW(id, pos, dir, grenadeType, throwPower)
+    local header = string.pack("<BH", PacketType.THROW, id)
+    return header .. BinaryNet.packVec3(pos) .. BinaryNet.packVec3(dir) .. BinaryNet.packString(grenadeType) .. BinaryNet.packFloat(throwPower)
+end
+
+-- Распаковать пакет THROW
+function BinaryNet.unpackTHROW(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local pos = BinaryNet.unpackVec3(data, offset)
+    offset = offset + 12
+    local dir = BinaryNet.unpackVec3(data, offset)
+    offset = offset + 12
+    local grenadeType, newOffset = BinaryNet.unpackString(data, offset)
+    local throwPower = BinaryNet.unpackFloat(data, newOffset)
+    return {id = id, pos = pos, dir = dir, grenadeType = grenadeType, throwPower = throwPower}, newOffset + 4
+end
+
+-- Упаковать пакет HIT: type(1) + shooterID(2) + targetID(2) + dmg(2) + partId(2) = 9 байт
+function BinaryNet.packHIT(shooterID, targetID, dmg, partId)
+    return string.pack("<BHHHH", PacketType.HIT, shooterID, targetID, dmg, partId)
+end
+
+-- Распаковать пакет HIT
+function BinaryNet.unpackHIT(data, offset)
+    local ptype, shooterID, targetID, dmg, partId = string.unpack("<BHHHH", data, offset)
+    return {shooterID = shooterID, targetID = targetID, dmg = dmg, partId = partId}, offset + 9
+end
+
+-- Упаковать пакет IMPACT: type(1) + id(2) + pos(12) + normal(12) + mat(стр) + sound(стр)
+function BinaryNet.packIMPACT(id, pos, normal, mat, sound)
+    local header = string.pack("<BH", PacketType.IMPACT, id)
+    return header .. BinaryNet.packVec3(pos) .. BinaryNet.packVec3(normal) .. BinaryNet.packString(mat) .. BinaryNet.packString(sound)
+end
+
+-- Распаковать пакет IMPACT
+function BinaryNet.unpackIMPACT(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local pos = BinaryNet.unpackVec3(data, offset)
+    offset = offset + 12
+    local normal = BinaryNet.unpackVec3(data, offset)
+    offset = offset + 12
+    local mat, newOffset = BinaryNet.unpackString(data, offset)
+    local snd, finalOffset = BinaryNet.unpackString(data, newOffset)
+    return {id = id, pos = pos, normal = normal, mat = mat, sound = snd}, finalOffset
+end
+
+-- Упаковать пакет BLOOD: type(1) + id(2) + pos(12) + normal(12) = 30 байт
+function BinaryNet.packBLOOD(id, pos, normal)
+    local header = string.pack("<BH", PacketType.BLOOD, id)
+    return header .. BinaryNet.packVec3(pos) .. BinaryNet.packVec3(normal)
+end
+
+-- Распаковать пакет BLOOD
+function BinaryNet.unpackBLOOD(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local pos = BinaryNet.unpackVec3(data, offset)
+    offset = offset + 12
+    local normal = BinaryNet.unpackVec3(data, offset)
+    offset = offset + 12
+    return {id = id, pos = pos, normal = normal}, offset
+end
+
+-- Упаковать пакет RESPAWN: type(1) + id(2) = 4 байта
+function BinaryNet.packRESPAWN(id)
+    return string.pack("<BH", PacketType.RESPAWN, id)
+end
+
+-- Распаковать пакет RESPAWN
+function BinaryNet.unpackRESPAWN(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    return {id = id}, offset + 3
+end
+
+-- Упаковать пакет MATCH_OVER: type(1) + winTeam(2) + score1(2) + score2(2) + mvpID(2) + mvpName(стр) + mvpReason(стр)
+function BinaryNet.packMATCH_OVER(winTeam, score1, score2, mvpID, mvpName, mvpReason)
+    local header = string.pack("<BHHHH", PacketType.MATCH_OVER, winTeam, score1, score2, mvpID)
+    return header .. BinaryNet.packString(mvpName) .. BinaryNet.packString(mvpReason)
+end
+
+-- Распаковать пакет MATCH_OVER
+function BinaryNet.unpackMATCH_OVER(data, offset)
+    local ptype, winTeam, score1, score2, mvpID = string.unpack("<BHHHH", data, offset)
+    offset = offset + 9
+    local mvpName, newOffset = BinaryNet.unpackString(data, offset)
+    local mvpReason, finalOffset = BinaryNet.unpackString(data, newOffset)
+    return {winTeam = winTeam, score1 = score1, score2 = score2, mvpID = mvpID, mvpName = mvpName, mvpReason = mvpReason}, finalOffset
+end
+
+-- Упаковать пакет ROUND_WIN: type(1) + winTeam(2) + score1(2) + score2(2) + mvpID(2) + mvpName(стр) + mvpReason(стр)
+function BinaryNet.packROUND_WIN(winTeam, score1, score2, mvpID, mvpName, mvpReason)
+    local header = string.pack("<BHHHH", PacketType.ROUND_WIN, winTeam, score1, score2, mvpID)
+    return header .. BinaryNet.packString(mvpName) .. BinaryNet.packString(mvpReason)
+end
+
+-- Распаковать пакет ROUND_WIN
+function BinaryNet.unpackROUND_WIN(data, offset)
+    local ptype, winTeam, score1, score2, mvpID = string.unpack("<BHHHH", data, offset)
+    offset = offset + 9
+    local mvpName, newOffset = BinaryNet.unpackString(data, offset)
+    local mvpReason, finalOffset = BinaryNet.unpackString(data, newOffset)
+    return {winTeam = winTeam, score1 = score1, score2 = score2, mvpID = mvpID, mvpName = mvpName, mvpReason = mvpReason}, finalOffset
+end
+
+-- Упаковать пакет ROUND_RESET: type(1) = 1 байт
+function BinaryNet.packROUND_RESET()
+    return string.pack("<B", PacketType.ROUND_RESET)
+end
+
+-- Упаковать пакет INIT: type(1) + mapName(стр)
+function BinaryNet.packINIT(mapName)
+    local header = string.pack("<B", PacketType.INIT)
+    return header .. BinaryNet.packString(mapName)
+end
+
+-- Распаковать пакет INIT
+function BinaryNet.unpackINIT(data, offset)
+    local ptype = string.unpack("<B", data, offset)
+    offset = offset + 1
+    local mapName, newOffset = BinaryNet.unpackString(data, offset)
+    return {mapName = mapName}, newOffset
+end
+
+-- Упаковать пакет MODE: type(1) + modeName(стр)
+function BinaryNet.packMODE(modeName)
+    local header = string.pack("<B", PacketType.MODE)
+    return header .. BinaryNet.packString(modeName)
+end
+
+-- Распаковать пакет MODE
+function BinaryNet.unpackMODE(data, offset)
+    local ptype = string.unpack("<B", data, offset)
+    offset = offset + 1
+    local modeName, newOffset = BinaryNet.unpackString(data, offset)
+    return {modeName = modeName}, newOffset
+end
+
+-- Упаковать пакет MNG_CHARGE: type(1) + id(2) = 4 байта
+function BinaryNet.packMNG_CHARGE(id)
+    return string.pack("<BH", PacketType.MNG_CHARGE, id)
+end
+
+-- Распаковать пакет MNG_CHARGE
+function BinaryNet.unpackMNG_CHARGE(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    return {id = id}, offset + 3
+end
+
+-- Упаковать пакет MNG_FIRE: type(1) + id(2) + pos(12) = 17 байт
+function BinaryNet.packMNG_FIRE(id, pos)
+    return string.pack("<BHfff", PacketType.MNG_FIRE, id, pos.x, pos.y, pos.z)
+end
+
+-- Распаковать пакет MNG_FIRE
+function BinaryNet.unpackMNG_FIRE(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    offset = offset + 3
+    local x, y, z = string.unpack("<fff", data, offset)
+    return {id = id, pos = {x = x, y = y, z = z}}, offset + 12
+end
+
+-- Упаковать пакет MNG_STOP: type(1) + id(2) = 4 байта
+function BinaryNet.packMNG_STOP(id)
+    return string.pack("<BH", PacketType.MNG_STOP, id)
+end
+
+-- Распаковать пакет MNG_STOP
+function BinaryNet.unpackMNG_STOP(data, offset)
+    local ptype, id = string.unpack("<BH", data, offset)
+    return {id = id}, offset + 3
+end
+
+-- Универсальная функция отправки бинарного пакета
+function BinaryNet.send(data)
+    Network.send(data)
+end
+
+-- Универсальная функция получения и парсинга бинарных пакетов
+function BinaryNet.receive()
+    local rawPackets = Network.receive() or {}
+    local parsedPackets = {}
+    
+    for _, raw in ipairs(rawPackets) do
+        if type(raw) == "string" and #raw >= 1 then
+            local ptype = string.unpack("<B", raw, 1)
+            local packet = {type = ptype, typeName = PacketTypeName[ptype], raw = raw}
+            
+            -- Парсим данные в зависимости от типа
+            if ptype == PacketType.POS then
+                packet.data = BinaryNet.unpackPOS(raw, 1)
+            elseif ptype == PacketType.SHOOT then
+                packet.data = BinaryNet.unpackSHOOT(raw, 1)
+            elseif ptype == PacketType.DEAD then
+                packet.data = BinaryNet.unpackDEAD(raw, 1)
+            elseif ptype == PacketType.TEAM then
+                packet.data = BinaryNet.unpackTEAM(raw, 1)
+            elseif ptype == PacketType.NAME then
+                packet.data = BinaryNet.unpackNAME(raw, 1)
+            elseif ptype == PacketType.SKIN then
+                packet.data = BinaryNet.unpackSKIN(raw, 1)
+            elseif ptype == PacketType.MUSICKIT then
+                packet.data = BinaryNet.unpackMUSICKIT(raw, 1)
+            elseif ptype == PacketType.WEAPON then
+                packet.data = BinaryNet.unpackWEAPON(raw, 1)
+            elseif ptype == PacketType.RELOAD then
+                packet.data = BinaryNet.unpackRELOAD(raw, 1)
+            elseif ptype == PacketType.PUMP then
+                packet.data = BinaryNet.unpackPUMP(raw, 1)
+            elseif ptype == PacketType.HELLO then
+                packet.data = BinaryNet.unpackHELLO(raw, 1)
+            elseif ptype == PacketType.ASSIGN then
+                packet.data = BinaryNet.unpackASSIGN(raw, 1)
+            elseif ptype == PacketType.DISCONNECT then
+                packet.data = BinaryNet.unpackDISCONNECT(raw, 1)
+            elseif ptype == PacketType.END then
+                packet.data = {}
+            elseif ptype == PacketType.HB then
+                packet.data = {}
+            elseif ptype == PacketType.PING then
+                packet.data = BinaryNet.unpackPING(raw, 1)
+            elseif ptype == PacketType.OBJ then
+                packet.data = BinaryNet.unpackOBJ(raw, 1)
+            elseif ptype == PacketType.EXPLOSION then
+                packet.data = BinaryNet.unpackEXPLOSION(raw, 1)
+            elseif ptype == PacketType.SMOKE then
+                packet.data = BinaryNet.unpackSMOKE(raw, 1)
+            elseif ptype == PacketType.FLASH then
+                packet.data = BinaryNet.unpackFLASH(raw, 1)
+            elseif ptype == PacketType.WARP then
+                packet.data = BinaryNet.unpackWARP(raw, 1)
+            elseif ptype == PacketType.THROW then
+                packet.data = BinaryNet.unpackTHROW(raw, 1)
+            elseif ptype == PacketType.HIT then
+                packet.data = BinaryNet.unpackHIT(raw, 1)
+            elseif ptype == PacketType.IMPACT then
+                packet.data = BinaryNet.unpackIMPACT(raw, 1)
+            elseif ptype == PacketType.BLOOD then
+                packet.data = BinaryNet.unpackBLOOD(raw, 1)
+            elseif ptype == PacketType.RESPAWN then
+                packet.data = BinaryNet.unpackRESPAWN(raw, 1)
+            elseif ptype == PacketType.MATCH_OVER then
+                packet.data = BinaryNet.unpackMATCH_OVER(raw, 1)
+            elseif ptype == PacketType.ROUND_WIN then
+                packet.data = BinaryNet.unpackROUND_WIN(raw, 1)
+            elseif ptype == PacketType.ROUND_RESET then
+                packet.data = {}
+            elseif ptype == PacketType.INIT then
+                packet.data = BinaryNet.unpackINIT(raw, 1)
+            elseif ptype == PacketType.MODE then
+                packet.data = BinaryNet.unpackMODE(raw, 1)
+            elseif ptype == PacketType.MNG_CHARGE then
+                packet.data = BinaryNet.unpackMNG_CHARGE(raw, 1)
+            elseif ptype == PacketType.MNG_FIRE then
+                packet.data = BinaryNet.unpackMNG_FIRE(raw, 1)
+            elseif ptype == PacketType.MNG_STOP then
+                packet.data = BinaryNet.unpackMNG_STOP(raw, 1)
+            end
+            
+            table.insert(parsedPackets, packet)
+        end
+    end
+    
+    return parsedPackets
+end
+
 -- Heartbeat от хоста
 hostBeatTimer = 0.0
 
